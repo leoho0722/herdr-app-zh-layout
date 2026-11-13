@@ -1,0 +1,8 @@
+{
+  "place": "none",
+  "title": "窗格標題列",
+  "cloned_from": {
+    "name": "pane",
+    "version": "0.1.15"
+  }
+}
