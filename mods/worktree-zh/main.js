@@ -3,7 +3,7 @@
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar } from "gpui-base";
-import { run, props, closeOverlay, theme, spaces, panes, exec, home } from "herdr";
+import { run, props, closeOverlay, theme, spaces, panes, exec, home, appHome, readTextFile, window } from "herdr";
 
 // Where a space is now: its first terminal's live folder, else where it was made.
 function place(s, all = panes()) {
@@ -12,14 +12,30 @@ function place(s, all = panes()) {
   return all.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder || null;
 }
 
-// Checkouts go to <ROOT>/<repo>/<branch, slashes as dashes>.
-const ROOT = (home) => `${home}/.herdr/worktrees`;
+// The mod owns this preference; paths belong to the space's machine, not the app.
+async function root(userHome) {
+  const raw = await readTextFile(`${appHome()}/settings.json`);
+  const directory = (raw === null ? {} : JSON.parse(raw))?.worktrees?.directory ?? "~/.herdr/worktrees";
+  if (typeof directory !== "string" || !directory.trim()) throw new Error("worktrees.directory 必須是非空白的路徑。");
+  let path = directory.replace(/\\/g, "/");
+  if (path === "~" || path.startsWith("~/")) path = userHome.replace(/\\/g, "/").replace(/\/$/, "") + path.slice(1);
+  if (!path.startsWith("/") && !/^[A-Za-z]:\//.test(path)) throw new Error("worktrees.directory 必須是絕對路徑，或以 ~/ 開頭。");
+  return path.replace(/\/+$/, "");
+}
 // Home as ~ (git says C:/Users/x where Windows says C:\Users\x).
 const tilde = (path, userHome) => {
   const [p, h] = [path, userHome].map((s) => s.replace(/\\/g, "/"));
   return p.startsWith(h) ? `~${p.slice(h.length)}` : path;
 };
-const slug = (branch) => branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+const slug = (branch) => {
+  const normalized = branch.normalize("NFC");
+  const name = normalized.replace(/[^\p{L}\p{M}\p{N}._-]+/gu, "-").replace(/^-+|-+$/g, "");
+  if (name) return name;
+  // Hash the original name so symbol-only branches do not share a folder.
+  let hash = 2166136261;
+  for (const char of normalized) hash = Math.imul(hash ^ char.codePointAt(0), 16777619);
+  return `branch-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+};
 const ago = (s) => {
   const d = Date.now() / 1000 - s;
   return d < 3600 ? `${Math.max(1, Math.round(d / 60))} 分鐘前` : d < 86400 ? `${Math.round(d / 3600)} 小時前` : d < 86400 * 60 ? `${Math.round(d / 86400)} 天前` : `${Math.round(d / 86400 / 30)} 個月前`;
@@ -103,7 +119,9 @@ async function repoOf(folder, on) {
   const common = await git(folder, ["rev-parse", "--path-format=absolute", "--git-common-dir"], on);
   if (!top.ok || !common.ok) return null;
   const main = common.out.endsWith("/.git") ? common.out.slice(0, -5) : common.out;
-  return { top: top.out, main, name: main.split("/").pop(), linked: main !== top.out };
+  // A bare repo hidden beside its worktrees (<project>/.bare) is named after its project.
+  const parts = main.split("/"), name = parts.at(-1) === ".bare" ? parts.at(-2) : parts.at(-1);
+  return { top: top.out, main, name, linked: main !== top.out };
 }
 
 export default class Worktree extends View {
@@ -137,6 +155,7 @@ export default class Worktree extends View {
           if (result.code !== 0 || !result.stdout.trim()) throw new Error("找不到遠端的家目錄。");
           this.userHome = result.stdout.trim().replace(/\\/g, "/");
         }
+        if (!this.opening && props()?.action !== "remove") this.root = await root(this.userHome);
         this.folder = props()?.folder || place(this.space()) || this.userHome;
         // The repo is set last: Enter does nothing until the warnings it consents to are known.
         const repo = await repoOf(this.folder, this.on);
@@ -172,11 +191,12 @@ export default class Worktree extends View {
   }
 
   async work(cx) {
-    if (this.busy || !this.repo) return;
+    const remove = props()?.action === "remove";
+    if (this.busy || !this.repo || (remove && !this.repo.linked)) return;
     this.busy = true;
     this.error = "";
     cx.notify();
-    try { this.error = props().action === "remove" ? await this.remove() : await this.create(); }
+    try { this.error = remove ? await this.remove() : await this.create(); }
     catch (error) { this.error = reason(error); }
     this.busy = false;
     if (!this.error) this.close();
@@ -186,7 +206,7 @@ export default class Worktree extends View {
   async create() {
     const branch = this.text.trim();
     if (!branch) return "請輸入分支名稱。";
-    const path = `${ROOT(this.userHome)}/${this.repo.name}/${slug(branch)}`;
+    const path = `${this.root}/${this.repo.name}/${slug(branch)}`;
     const exists = (await git(this.repo.main, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], this.on)).ok;
     const add = exists ? ["worktree", "add", path, branch] : ["worktree", "add", "-b", branch, path, "HEAD"];
     const r = await git(this.repo.top, add, this.on, 600_000);
@@ -222,11 +242,23 @@ export default class Worktree extends View {
     this.dirty ||= status.out !== "";
     this.unpushed = [...new Set([...this.unpushed, ...unpushed])];
     if (changed) return "自開啟後已有變動。再按一次 Enter 仍會移除。";
-    // Terminals first: a shell sitting in the folder keeps it busy on Windows.
-    run("space.close", { id: s.id, confirmed: true });
+    const list = await git(this.repo.main, ["-c", "core.quotePath=false", "worktree", "list", "--porcelain"], this.on);
+    if (!list.ok) return list.err || "git worktree list 執行失敗。";
+    const checkout = list.out.split(/\n\n+/).map((record) => record.split("\n"))
+      .find(([path]) => path === `worktree ${this.repo.top}`);
+    const lock = checkout?.find((field) => field === "locked" || field.startsWith("locked "));
+    if (lock) return lock === "locked" ? "這個工作樹已鎖定。" : `這個工作樹已鎖定：${lock.slice(7)}`;
+
+    // Git on a remote Windows machine reports a drive-letter or UNC path.
+    const windows = this.on ? /^(?:[A-Za-z]:\/|\/\/)/.test(this.repo.top) : window().platform === "windows";
+    const closeSpace = () => { if (s?.id) run("space.close", { id: s.id, confirmed: true }); };
+    // A shell sitting in the folder can keep it busy on Windows.
+    if (windows) closeSpace();
     const force = this.dirty || mods.length > 0;
     const r = await git(this.repo.main, ["worktree", "remove", ...(force ? ["--force"] : []), this.repo.top], this.on, 600_000);
-    return r.ok ? "" : r.err || "git worktree remove 執行失敗。";
+    if (!r.ok) return r.err || "git worktree remove 執行失敗。";
+    if (!windows) closeSpace();
+    return "";
   }
 
   key(e, cx) {
@@ -324,7 +356,7 @@ export default class Worktree extends View {
             ? !r.linked
               ? "這是儲存庫的主工作目錄，不是工作樹。"
               : `會關閉此空間並刪除 ${tilde(r.top, this.userHome)}。分支會保留。`
-            : `在 ${tilde(ROOT(this.userHome), this.userHome)}/${r.name}/ 內的工作目錄上建立新空間。已存在的分支會直接簽出；新分支則從目前的 HEAD 開始。`;
+            : `在 ${tilde(this.root, this.userHome)}/${r.name}/ 內的工作目錄上建立新空間。已存在的分支會直接簽出；新分支則從目前的 HEAD 開始。`;
     const blocked = !r || (remove && !r.linked);
     return v_flex()
       .id("worktree")
