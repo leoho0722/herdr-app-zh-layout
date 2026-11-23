@@ -144,6 +144,9 @@ export default class Tabs extends View {
     return h_flex().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
       .on_mouse_up("left", () => { this.pressed = null; })
       .on_scroll_wheel(e => this.wheel(e))
+      // The sidebar's fold hides it: this is the way back (cmd-b too).
+      .when(Boolean(sidebar?.hidden), el => el.child(button("sidebar-show", svg("mods/workspace-chrome/sidebar.svg").size(15), () => run("layout.show", { id: "sidebar" }))
+        .mr(4).tooltip("展開側欄")))
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().track_scroll(this.scroll)
         .on_size_change((_size, cx) => { if (active >= 0) { this.scroll.scroll_to_item(active); cx.notify(); } })
         .children(shown.map(item)))
